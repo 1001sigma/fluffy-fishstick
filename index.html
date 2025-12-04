@@ -267,11 +267,185 @@
             const now = Date.now();
             if (gestures.isPalmOpen && (now - uiState.lastToggleTime > 1000)) {
                 uiState.isOpen = !uiState.isOpen;
-                uiState.lastToggleTime = now;
+                uiState.lastToggleTime = 0;
                 // 重置当前笔画，防止意外连线
                 currentStroke = null;
             }
 
             // C. 菜单交互 (菜单开启 + 食指指向)
             if (uiState.isOpen) {
-                drawMenu(indexTipPx, gestures.isP
+                drawMenu(indexTipPx, gestures.isPointing);
+            } 
+            // D. 写字 (菜单关闭 + 捏合)
+            else if (gestures.isPinching) {
+                // 计算相对于缩放和偏移的原始坐标
+                // Inverse transform: rawX = (screenX - offsetX) / zoom
+                const rawX = (indexTipPx.x - settings.offset.x) / settings.zoom;
+                const rawY = (indexTipPx.y - settings.offset.y) / settings.zoom;
+
+                if (!currentStroke) {
+                    currentStroke = {
+                        points: [{x: rawX, y: rawY}],
+                        color: settings.isEraser ? 'rgba(0,0,0,1)' : settings.color, // 橡皮擦实质是合成操作，这里颜色占位
+                        size: settings.size,
+                        isEraser: settings.isEraser
+                    };
+                    strokes.push(currentStroke);
+                } else {
+                    currentStroke.points.push({x: rawX, y: rawY});
+                }
+                
+                // 绘制笔尖指示器
+                canvasCtx.beginPath();
+                canvasCtx.arc(indexTipPx.x, indexTipPx.y, 5, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = settings.color;
+                canvasCtx.fill();
+            } else {
+                currentStroke = null;
+                // 绘制悬浮光标
+                canvasCtx.beginPath();
+                canvasCtx.arc(indexTipPx.x, indexTipPx.y, 3, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = 'white';
+                canvasCtx.fill();
+            }
+        }
+
+        renderStrokes();
+        renderParticles();
+        
+        canvasCtx.restore();
+    }
+
+    // --- 渲染函数 ---
+
+    function renderStrokes() {
+        canvasCtx.save();
+        // 应用全局变换
+        canvasCtx.translate(settings.offset.x, settings.offset.y);
+        canvasCtx.scale(settings.zoom, settings.zoom);
+        
+        canvasCtx.lineCap = 'round';
+        canvasCtx.lineJoin = 'round';
+
+        strokes.forEach(stroke => {
+            if (stroke.points.length < 2) return;
+
+            canvasCtx.beginPath();
+            canvasCtx.lineWidth = stroke.size;
+            
+            if (stroke.isEraser) {
+                canvasCtx.globalCompositeOperation = 'destination-out';
+                canvasCtx.strokeStyle = 'rgba(0,0,0,1)'; 
+            } else {
+                canvasCtx.globalCompositeOperation = 'source-over';
+                canvasCtx.strokeStyle = stroke.color;
+            }
+
+            canvasCtx.moveTo(stroke.points[0].x, stroke.points[0].y);
+            for (let i = 1; i < stroke.points.length; i++) {
+                // 二次贝塞尔曲线平滑
+                // const midPoint = midPointBtw(stroke.points[i-1], stroke.points[i]);
+                // canvasCtx.quadraticCurveTo(stroke.points[i-1].x, stroke.points[i-1].y, midPoint.x, midPoint.y);
+                canvasCtx.lineTo(stroke.points[i].x, stroke.points[i].y);
+            }
+            canvasCtx.stroke();
+        });
+        canvasCtx.restore();
+    }
+
+    function renderParticles() {
+        if (particles.length > 0) {
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.update();
+                p.draw(canvasCtx);
+                if (p.life <= 0) {
+                    particles.splice(i, 1);
+                }
+            }
+        }
+    }
+
+    function drawMenu(pointerPx, isPointing) {
+        // 半透明背景
+        canvasCtx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        canvasCtx.fillRect(0, 0, canvasElement.width, canvasElement.height);
+        
+        canvasCtx.font = "20px Arial";
+        canvasCtx.textAlign = "center";
+        canvasCtx.textBaseline = "middle";
+
+        uiState.buttons.forEach(btn => {
+            let isHover = false;
+            // 简单的矩形碰撞检测
+            if (isPointing && 
+                pointerPx.x > btn.x && pointerPx.x < btn.x + btn.w &&
+                pointerPx.y > btn.y && pointerPx.y < btn.y + btn.h) {
+                isHover = true;
+                
+                // 触发选择
+                if (btn.type === 'tool') {
+                    settings.isEraser = (btn.val === 'eraser');
+                } else if (btn.type === 'color') {
+                    settings.color = btn.val;
+                    settings.isEraser = false;
+                } else if (btn.type === 'size') {
+                    settings.size = btn.val;
+                }
+            }
+
+            // 绘制按钮背景
+            let isActive = false;
+            if (btn.type === 'tool') isActive = (settings.isEraser && btn.val === 'eraser') || (!settings.isEraser && btn.val === 'pen');
+            if (btn.type === 'color') isActive = (settings.color === btn.val && !settings.isEraser);
+            if (btn.type === 'size') isActive = (settings.size === btn.val);
+
+            if (isHover) canvasCtx.fillStyle = '#666';
+            else if (isActive) canvasCtx.fillStyle = '#00aa00'; // 选中状态
+            else canvasCtx.fillStyle = '#333';
+
+            canvasCtx.fillRect(btn.x, btn.y, btn.w, btn.h);
+            canvasCtx.strokeStyle = 'white';
+            canvasCtx.lineWidth = 2;
+            canvasCtx.strokeRect(btn.x, btn.y, btn.w, btn.h);
+
+            // 绘制文字
+            canvasCtx.fillStyle = 'white';
+            if(btn.type === 'color') canvasCtx.fillStyle = btn.val; // 颜色按钮文字直接用颜色
+            canvasCtx.fillText(btn.label, btn.x + btn.w/2, btn.y + btn.h/2);
+        });
+
+        // 绘制光标
+        canvasCtx.beginPath();
+        canvasCtx.arc(pointerPx.x, pointerPx.y, 8, 0, 2*Math.PI);
+        canvasCtx.fillStyle = isPointing ? 'cyan' : 'red'; // 指向时变色
+        canvasCtx.fill();
+    }
+
+
+    // --- MediaPipe 初始化 ---
+    const hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+
+    hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7, // 提高置信度以减少抖动
+        minTrackingConfidence: 0.7
+    });
+
+    hands.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({image: videoElement});
+        },
+        width: 1280,
+        height: 720
+    });
+    camera.start();
+
+</script>
+</body>
+</html>
