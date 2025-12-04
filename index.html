@@ -29,10 +29,7 @@
 <body>
     <div id="info">请允许使用摄像头. (握拳: 聚合 | 张开: 扩散 | 拇指食指捏合: 绘图)</div>
 
-    <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/dist/tasks-vision.global.js"></script>
     
     <script>
         // ====================================================================
@@ -292,43 +289,81 @@
         // === MediaPipe 手势处理 ===
         // ====================================================================
 
-        function initMediaPipe() {
-            video = document.createElement('video');
-            document.body.appendChild(video); // 视频元素虽然隐藏，但必须存在
+                // ====================================================================
+        // === MediaPipe Tasks (新架构) 变量和初始化 ===
+        // ====================================================================
 
-            hands = new Hands({locateFile: (file) => {
-                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${file}`;
-            }});
-            
-            hands.setOptions({
-                maxNumHands: 2,
-                modelComplexity: 1, // 增加复杂性以提高精度
-                minDetectionConfidence: 0.5,
-                minTrackingConfidence: 0.5
-            });
-            
-            hands.onResults(onResults);
+        let video;
+        let handDetector;
+        const { HandLandmarker, FilesetResolver } = window.MediaPipeTasksVision;
 
-            // 启动摄像头
-            const cameraCapture = new Camera(video, {
-                onFrame: async () => {
-                    await hands.send({image: video});
+        // MediaPipe 初始化，使用新的 HandLandmarker
+        async function initMediaPipe() {
+            document.getElementById('info').textContent = '正在加载手部检测模型...';
+
+            // 1. 获取模型文件解析器
+            const filesetResolver = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+            );
+
+            // 2. 创建手部关键点检测器
+            handDetector = await HandLandmarker.create(filesetResolver, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                    delegate: "GPU" // 尝试使用 GPU 加速
                 },
-                width: 640,
-                height: 480
+                runningMode: "VIDEO", // 视频模式，实时处理
+                numHands: 2
             });
-            cameraCapture.start();
-        }
 
-        function onResults(results) {
-            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-                processHandGestures(results.multiHandLandmarks);
-            } else {
-                // 没有手部检测到时，粒子系统逐渐恢复到中间状态
-                currentHandOpenness = 0.5;
+            document.getElementById('info').textContent = '模型加载完成。正在启动摄像头...';
+
+            // 3. 设置视频元素并启动摄像头
+            video = document.createElement('video');
+            video.style.display = 'none'; // 保持隐藏
+            video.autoplay = true;
+            video.playsInline = true; 
+            document.body.appendChild(video);
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                video.srcObject = stream;
+
+                // 等待视频元数据加载完成后再开始检测
+                video.onloadedmetadata = () => {
+                    video.play();
+                    // 在下一帧开始检测
+                    requestAnimationFrame(detectHands);
+                    document.getElementById('info').textContent = '摄像头已启动。请尝试张合手掌。';
+                };
+
+            } catch (err) {
+                console.error("无法访问摄像头: ", err);
+                document.getElementById('info').textContent = '错误：无法访问摄像头。请检查权限或使用支持的浏览器。';
             }
         }
-        
+
+        // 实时检测函数 (在 Three.js 的 Animate 循环中或独立的循环中运行)
+        let lastVideoTime = -1;
+        function detectHands() {
+            const nowInMs = Date.now();
+            if (video.currentTime !== lastVideoTime) {
+                lastVideoTime = video.currentTime;
+                // 异步检测手部关键点
+                const results = handDetector.detectForVideo(video, nowInMs);
+                
+                if (results.landmarks && results.landmarks.length > 0) {
+                    processHandGestures(results.landmarks);
+                } else {
+                    // 没有手部检测到时，粒子系统逐渐恢复到中间状态
+                    currentHandOpenness = THREE.MathUtils.lerp(currentHandOpenness, 0.5, 0.05);
+                }
+            }
+            
+            // 确保 MediaPipe 的检测循环持续进行
+            requestAnimationFrame(detectHands);
+        }
+
         // 用于存储 MediaPipe 计算的当前手部张开因子
         let currentHandOpenness = 0.5; 
         
@@ -337,14 +372,23 @@
             return currentHandOpenness;
         }
 
+        // 关键点处理逻辑保持不变，但输入格式略有不同 (是 LandmarkerResult.landmarks)
         function processHandGestures(landmarksArray) {
             let opennessSum = 0;
             
             // 检查绘图模式：任一只手拇指 (4) 和食指 (8) 捏合
             isDrawing = landmarksArray.some(landmarks => {
-                const thumbTip = new THREE.Vector3().fromArray(landmarks[4]);
-                const indexTip = new THREE.Vector3().fromArray(landmarks[8]);
-                return thumbTip.distanceTo(indexTip) < 0.05; // 欧式距离小于阈值
+                // 关键点数据结构：{x, y, z}
+                const thumbTip = landmarks[4]; 
+                const indexTip = landmarks[8];
+                
+                // 计算欧式距离 (使用 x, y, z 属性)
+                const dist = Math.sqrt(
+                    Math.pow(thumbTip.x - indexTip.x, 2) +
+                    Math.pow(thumbTip.y - indexTip.y, 2) +
+                    Math.pow(thumbTip.z - indexTip.z, 2)
+                );
+                return dist < 0.05; // 阈值 0.05
             });
 
             if (settings.enableDrawing && isDrawing) {
@@ -358,22 +402,31 @@
             // 正常聚合/扩散逻辑
             landmarksArray.forEach(landmarks => {
                 // 掌心 (9) 和 腕部 (0)
-                const center = new THREE.Vector3().fromArray(landmarks[9]);
-                const wrist = new THREE.Vector3().fromArray(landmarks[0]);
-                const handDepth = center.distanceTo(wrist); // 估算手的大小/深度
+                const center = landmarks[9];
+                const wrist = landmarks[0];
+                
+                // 计算手部大小作为归一化参考
+                const handDepth = Math.sqrt(
+                    Math.pow(center.x - wrist.x, 2) +
+                    Math.pow(center.y - wrist.y, 2) +
+                    Math.pow(center.z - wrist.z, 2)
+                ); 
 
                 let fingerDistanceSum = 0;
                 // 检测四指：食指 (8), 中指 (12), 无名指 (16), 小指 (20)
                 const fingerTips = [8, 12, 16, 20];
 
                 fingerTips.forEach(tipIndex => {
-                    const tip = new THREE.Vector3().fromArray(landmarks[tipIndex]);
+                    const tip = landmarks[tipIndex];
                     // 计算指尖到掌心的距离
-                    fingerDistanceSum += tip.distanceTo(center);
+                    fingerDistanceSum += Math.sqrt(
+                        Math.pow(tip.x - center.x, 2) +
+                        Math.pow(tip.y - center.y, 2) +
+                        Math.pow(tip.z - center.z, 2)
+                    );
                 });
                 
-                // 估算开放程度 (归一化): 距离总和 / 理论最大距离
-                // 握拳时距离总和最小，张开时最大。
+                // 归一化开放程度
                 const minDistance = handDepth * 1.5; // 估算握拳时的最小距离
                 const maxDistance = handDepth * 4.0; // 估算张开时的最大距离
                 
@@ -392,9 +445,10 @@
                  currentHandOpenness = opennessSum / 2;
             } else {
                 // 未满足模式条件时，保持中立
-                currentHandOpenness = 0.5; 
+                currentHandOpenness = THREE.MathUtils.lerp(currentHandOpenness, 0.5, 0.05);
             }
         }
+
 
 
         // ====================================================================
